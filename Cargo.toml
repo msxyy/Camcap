@@ -1,0 +1,33 @@
+﻿[package]
+name = "camcap"
+version = "0.1.0"
+edition = "2021"
+description = "Rust AMCap-style webcam capture tool (preview / snapshot / record)"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+chrono = "0.4"
+crossbeam-channel = "0.5"
+eframe = "0.29"
+egui = "0.29"
+env_logger = "0.11"
+image = { version = "0.25", features = ["jpeg", "png", "bmp"] }
+log = "0.4"
+zune-jpeg = { version = "0.4.21", features = ["x86"] }
+zune-core = "0.4.12"
+muxide = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_DirectShow",
+    "Win32_System_Com",
+] }
+windows-core = "0.58"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
