@@ -17,7 +17,6 @@ const HOTPLUG_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const PURE_HINT_DURATION: Duration = Duration::from_secs(3);
 const PURE_HINT_FADE_DURATION: f32 = 0.5;
 
-/// 设备条目。`link` 是 USB 端口级唯一的 SymbolicLink。
 #[derive(Clone, Debug)]
 struct CameraEntry {
     index: u32,
@@ -25,15 +24,12 @@ struct CameraEntry {
     link: String,
 }
 
-/// 后台自动打开线程回传给 UI 的结果。
-/// `Some` 表示一个 slot 的打开结果，`None` 表示后台线程全部完成（sentinel）。
 struct AutoOpenResult {
     slot_index: usize,
     entry: CameraEntry,
     result: Result<CaptureHandle, String>,
 }
 
-/// 提取 SymbolicLink 里的 USB 端口哈希段（`7&xxxxxxxx`）用于 UI 显示。
 fn short_link(link: &str) -> String {
     if let Some(pos) = link.find("#7&") {
         let start = pos + 3;
@@ -134,10 +130,6 @@ impl Fps {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// 格式分组
-// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 struct FormatGroup {
@@ -688,15 +680,9 @@ pub struct CamCapApp {
     current_window_size: Option<[f32; 2]>,
     known_device_links: Vec<String>,
     last_poll: Instant,
-    /// 启动时待自动打开的摄像头列表（slot_index + 设备）。
-    /// `new` 里填充，`update` 第一帧取走启动后台线程。
     pending_auto_open: Vec<(usize, CameraEntry)>,
-    /// 后台自动打开线程的结果接收端。
-    /// `Some(result)` 表示一个 slot 的打开结果，`None` 表示后台线程全部完成。
     auto_open_rx: Receiver<Option<AutoOpenResult>>,
-    /// 后台自动打开线程的结果发送端。clone 给后台线程。
     auto_open_tx: Sender<Option<AutoOpenResult>>,
-    /// 后台自动打开是否还在进行中。收到 sentinel 后置 false。
     auto_open_in_progress: bool,
 }
 
@@ -749,9 +735,6 @@ impl CamCapApp {
             }
         }
 
-        // 启动自动打开：按当前设备数量分配，slot A 用 cameras[0]，slot B 用 cameras[1]。
-        // **改为后台异步打开**，`new` 里只记录待打开列表，实际打开在 `update` 第一帧
-        // 启动后台线程。这样 UI 先出现（~250ms），画面在 1s 内异步填充，不再阻塞启动。
         let mut pending_auto_open = Vec::new();
         for (si, entry) in cameras.iter().enumerate().take(2) {
             pending_auto_open.push((si, entry.clone()));
@@ -867,6 +850,16 @@ impl CamCapApp {
             removed.len(),
             added.len()
         );
+
+        // 拔出设备时清除对应 index 的格式缓存。
+        // 场景：A 拔出，B 插到同一个 USB 口（SymbolicLink 相同）。
+        // 不清缓存的话，B 会复用 A 的格式列表，导致分辨率对不上。
+        // 此时 self.cameras 还是旧列表（包含 A），能按 link 找到 A 的 index。
+        for link in &removed {
+            if let Some(entry) = self.cameras.iter().find(|c| c.link == *link) {
+                crate::capture::clear_format_cache(entry.index);
+            }
+        }
 
         self.cameras = list
             .into_iter()
@@ -1631,8 +1624,6 @@ fn render_props_window(ctx: &egui::Context, slot: &mut CameraSlot, tag: &str) {
 
 impl eframe::App for CamCapApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 启动自动打开：第一帧启动后台线程，之后每帧 try_recv 收集结果。
-        // UI 在 ~250ms 出现，画面异步填充（~0.5–1s）。
         if !self.pending_auto_open.is_empty() && !self.auto_open_in_progress {
             self.auto_open_in_progress = true;
             let pending = std::mem::take(&mut self.pending_auto_open);
@@ -1647,8 +1638,6 @@ impl eframe::App for CamCapApp {
             );
             std::thread::spawn(move || {
                 for ((si, entry), preferred) in pending.into_iter().zip(prefs.into_iter()) {
-                    // CaptureHandle::start_with_format 返回 anyhow::Result，
-                    // AutoOpenResult.result 声明的是 Result<_, String>，转一下。
                     let result = CaptureHandle::start_with_format(entry.index, preferred)
                         .map_err(|e| e.to_string());
                     if tx
@@ -1659,18 +1648,13 @@ impl eframe::App for CamCapApp {
                         }))
                         .is_err()
                     {
-                        // UI 线程已退出（窗口关闭），直接退出
                         return;
                     }
                 }
-                // sentinel：告知 UI 全部完成
                 let _ = tx.send(None);
             });
         }
 
-        // 收集后台自动打开结果。
-        // 保护：如果用户在打开完成前手动操作过该 slot（关闭 / 重新打开），
-        // 丢弃后台结果。CaptureHandle drop 会触发 stop 清理。
         while let Ok(msg) = self.auto_open_rx.try_recv() {
             match msg {
                 Some(msg) => {
@@ -1684,7 +1668,6 @@ impl eframe::App for CamCapApp {
                                     "启动自动打开 {}: 用户已手动操作，丢弃后台结果",
                                     tag
                                 );
-                                // cap 被 drop，CaptureHandle::Drop 会 stop 线程
                             } else {
                                 slot.install_capture(&msg.entry, cap);
                                 log::info!("启动自动打开 {}: {}", tag, msg.entry.name);
@@ -2069,7 +2052,6 @@ impl eframe::App for CamCapApp {
             } else if any_recording {
                 ctx.request_repaint_after(Duration::from_millis(200));
             } else if self.auto_open_in_progress {
-                // 自动打开进行中，50ms 刷一次，尽快发现结果
                 ctx.request_repaint_after(Duration::from_millis(50));
             } else if self.config_dirty
                 || self.slots[0].config_dirty

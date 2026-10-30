@@ -61,6 +61,24 @@ fn format_cache() -> &'static Mutex<HashMap<u32, (Vec<SendMediaType>, Vec<VideoF
     FORMAT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// 清除指定 `camera_index` 的格式缓存。
+///
+/// 场景：用户拔掉设备 A，把设备 B 插到同一个 USB 口。
+/// B 的 `SymbolicLink` 和 A 相同，`poll_hotplug` 认为这是同一个物理位置，
+/// 但 B 的格式列表可能和 A 完全不同（比如 A 支持 2592x1944，B 只支持 1920x1080）。
+/// 如果不清缓存，`mf_control_loop` 会命中 A 的格式列表，UI 下拉里显示 A 的格式，
+/// 实际打开 B 时 `SetCurrentMediaType` 失败或画面不对。
+pub fn clear_format_cache(camera_index: u32) {
+    if let Ok(mut g) = format_cache().lock() {
+        if g.remove(&camera_index).is_some() {
+            log::info!(
+                "清除 camera_index={} 的格式缓存（设备已变化）",
+                camera_index
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 格式类型
 // ---------------------------------------------------------------------------
@@ -93,7 +111,6 @@ impl FormatSubtype {
         }
     }
 
-    /// 配置持久化用：subtype → u8
     pub fn to_u8(self) -> u8 {
         match self {
             Self::Mjpeg => 0,
@@ -102,7 +119,6 @@ impl FormatSubtype {
         }
     }
 
-    /// 配置加载用：u8 → subtype
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::Mjpeg),
@@ -192,11 +208,8 @@ struct SharedState {
     proc_amp: Mutex<Option<IAMVideoProcAmp>>,
     camera_control: Mutex<Option<IAMCameraControl>>,
     preview_tx: Sender<Arc<Vec<u8>>>,
-    /// preview 队列的 clone，切换格式时用于 drain 掉切换前积压的旧帧。
     preview_rx_for_drain: Receiver<Arc<Vec<u8>>>,
-    /// CaptureHandle 的 latest clone，切换时清空，让 UI 显示“等待首帧”
     latest: Arc<Mutex<Option<Arc<Frame>>>>,
-    /// 当前生效的采集尺寸。YUY2 / H264 解码线程每帧读取。
     current_dims: Arc<Mutex<(u32, u32)>>,
     recorder_tx: Arc<Mutex<Option<SyncSender<Arc<Vec<u8>>>>>>,
     capturing: Arc<AtomicBool>,
@@ -236,8 +249,6 @@ impl IMFSourceReaderCallback_Impl for CaptureCallback_Impl {
         self.state.read_pending.store(false, Ordering::Release);
 
         if hrstatus.is_err() {
-            // 驱动报错，设备可能已断开。置位标志让 UI 显示提示。
-            // 不续读，避免反复报错刷屏。
             if !self.state.error_flag.load(Ordering::Relaxed) {
                 log::warn!("采集错误 0x{:08X}，设备可能已断开", hrstatus.0);
                 self.state.error_flag.store(true, Ordering::Relaxed);
@@ -349,9 +360,6 @@ struct PendingSwitchState {
     started_at: Instant,
 }
 
-/// `poll_switch` 的返回类型。
-/// - `Success(fmt)`：切换成功，`CaptureHandle` 的 `width/height/current_format_idx` 已更新
-/// - `Failed(e)`：切换失败或超时，`group_idx/fps_idx` 需要 UI 侧回滚
 #[derive(Clone, Debug)]
 pub enum SwitchOutcome {
     Success(VideoFormat),
@@ -541,7 +549,6 @@ impl CaptureHandle {
         self.frames.load(Ordering::Relaxed)
     }
 
-    /// 是否有采集错误（设备断开）。UI 侧用于状态栏提示。
     pub fn has_error(&self) -> bool {
         self.error_flag.load(Ordering::Relaxed)
     }
@@ -576,8 +583,6 @@ impl CaptureHandle {
             .map_err(|e| anyhow!("发送控制命令失败: {}", e))
     }
 
-    /// 发起异步格式切换。只发送命令，不阻塞 UI 线程。
-    /// 完成后通过 `poll_switch` 获取结果。
     pub fn request_format(&mut self, index: usize) -> std::result::Result<(), String> {
         {
             let g = self.pending_switch.lock().unwrap();
@@ -609,7 +614,6 @@ impl CaptureHandle {
         Ok(())
     }
 
-    /// 轮询异步切换结果。返回 `Some` 表示已完成（成功或失败）。
     pub fn poll_switch(&mut self) -> Option<SwitchOutcome> {
         let (target_idx, started_at, recv_result) = {
             let g = self.pending_switch.lock().unwrap();
@@ -650,13 +654,10 @@ impl CaptureHandle {
         }
     }
 
-    /// 是否有切换正在进行中。UI 侧用于禁用格式/帧率下拉。
     pub fn is_switching(&self) -> bool {
         self.pending_switch.lock().unwrap().is_some()
     }
 
-    /// 同步热切换格式。保留给特殊场景（测试、脚本）。
-    /// 正常 UI 流程请用 `request_format` + `poll_switch`。
     #[allow(dead_code)]
     pub fn set_format(&mut self, index: usize) -> Result<VideoFormat> {
         let new_fmt = self
@@ -744,8 +745,6 @@ fn mf_control_loop(
         CoInitializeEx(None, COINIT_MULTITHREADED)
             .ok()
             .map_err(|e| anyhow!("CoInitializeEx 失败: {}", e))?;
-        // 进程级只 MFStartup 一次，后续跨 subtype 切换跳过。
-        // 配对 MFShutdown 在 main.rs 进程退出时调 mf::shutdown()。
         crate::mf::ensure_startup()?;
 
         let result = (|| -> Result<()> {
@@ -770,7 +769,6 @@ fn mf_control_loop(
             let reader: IMFSourceReader =
                 MFCreateSourceReaderFromMediaSource(&source, &attrs)?;
 
-            // P6.4：格式列表缓存。同一摄像头运行期内不变，切换 reader 时跳过枚举。
             let (media_types, video_formats) = {
                 let mut g = format_cache().lock().unwrap();
                 if let Some(cached) = g.get(&camera_index) {
@@ -816,10 +814,6 @@ fn mf_control_loop(
                     }) {
                         Some(i) => i,
                         None => {
-                            // preferred 指定的格式该设备不支持。
-                            // 场景：配置里存的是同型号另一台设备的格式，换设备后不匹配。
-                            // 回退到第一个 MJPEG 格式，保证用户至少能看到画面，
-                            // 而不是「打开失败」一片空白。
                             let fallback = video_formats
                                 .iter()
                                 .position(|f| f.subtype == FormatSubtype::Mjpeg)
@@ -1090,8 +1084,6 @@ fn mf_control_loop(
             Ok(())
         })();
 
-        // 不在此处 MFShutdown。进程级配对由 main.rs 退出时调 mf::shutdown() 完成。
-        // 跨 subtype 切换每次省 200ms。
         result
     }
 }
