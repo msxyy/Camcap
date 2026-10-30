@@ -1,7 +1,11 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod camera;
 mod capture;
+mod config;
 mod h264_preview;
+mod mf;
 mod photo;
 mod recorder;
 
@@ -32,7 +36,6 @@ impl Write for TeeWriter {
 }
 
 fn main() -> Result<()> {
-    // [TIMING] 启动总计时起点
     let t_start = std::time::Instant::now();
 
     let log_file = std::fs::OpenOptions::new()
@@ -54,21 +57,27 @@ fn main() -> Result<()> {
 
     builder.init();
 
+    let cfg = config::load();
+    let inner_size = cfg.window_size.unwrap_or([1280.0, 720.0]);
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 720.0])
+            .with_inner_size(inner_size)
             .with_title("CamCap"),
         ..Default::default()
     };
 
-    log::info!("[TIMING] main 入口到 run_native 前: {:?}", t_start.elapsed());
+    log::info!(
+        "[TIMING] main 入口到 run_native 前: {:?}",
+        t_start.elapsed()
+    );
 
     eframe::run_native(
         "CamCap",
         options,
         Box::new(move |cc| {
             let t_ui = std::time::Instant::now();
-            let app = app::CamCapApp::new(cc);
+            let app = app::CamCapApp::new(cc, cfg);
             log::info!("[TIMING] CamCapApp::new: {:?}", t_ui.elapsed());
             log::info!(
                 "[TIMING] 启动总耗时（main → UI 就绪）: {:?}",
@@ -78,6 +87,8 @@ fn main() -> Result<()> {
         }),
     )
     .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    mf::shutdown();
 
     Ok(())
 }

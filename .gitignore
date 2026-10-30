@@ -1,4 +1,29 @@
+# 编译产物
 /target
-camcap-output/
-camcap-run.log
 *.pdb
+
+# 运行输出（含用户隐私：照片/视频）
+/camcap-output/
+
+# 运行日志（含用户名路径、设备名）
+camcap-run.log
+*.log
+
+# 打包产物
+/dist
+*.zip
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# 系统缓存
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 临时文件
+*.tmp
+*.bak
+*~

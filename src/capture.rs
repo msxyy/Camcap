@@ -1,8 +1,9 @@
 ﻿use anyhow::{anyhow, Result};
 use crossbeam_channel::{bounded, Receiver, Sender};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::SyncSender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use zune_core::{colorspace::ColorSpace, options::DecoderOptions};
@@ -17,7 +18,7 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 const DECODER_THREADS: usize = 2;
 const PREVIEW_QUEUE_CAP: usize = 16;
 
-const FIRST_FRAME_WAIT_MS: u64 = 300;
+const FIRST_FRAME_WAIT_MS: u64 = 100;
 const SWITCH_SETTLE_TIMEOUT_MS: u64 = 2000;
 const SWITCH_REPLY_TIMEOUT_MS: u64 = 3000;
 
@@ -34,6 +35,30 @@ fn should_log_formats(camera_index: u32) -> bool {
         Ok(mut s) => s.insert(camera_index),
         Err(_) => true,
     }
+}
+
+// ---------------------------------------------------------------------------
+// P6.4：格式列表缓存
+// ---------------------------------------------------------------------------
+
+/// 包装 `IMFMediaType`，使其可存入进程级 static 缓存。
+///
+/// windows-rs 默认不给 COM 接口类型实现 `Send`/`Sync`，因为编译器无法确认
+/// 线程安全（`IUnknown` 内部是 `NonNull<c_void>`）。但 `mf_control_loop`
+/// 里 `CoInitializeEx(COINIT_MULTITHREADED)` 是 **MTA**，COM 对象在 MTA 下
+/// 可跨线程 AddRef/Release/SetCurrentMediaType，这是 COM 规范保证的。
+///
+/// **如果未来把 `COINIT_MULTITHREADED` 改成 STA，必须去掉这个包装**，
+/// 否则跨线程访问 COM 对象是未定义行为。
+struct SendMediaType(IMFMediaType);
+unsafe impl Send for SendMediaType {}
+unsafe impl Sync for SendMediaType {}
+
+static FORMAT_CACHE: OnceLock<Mutex<HashMap<u32, (Vec<SendMediaType>, Vec<VideoFormat>)>>> =
+    OnceLock::new();
+
+fn format_cache() -> &'static Mutex<HashMap<u32, (Vec<SendMediaType>, Vec<VideoFormat>)>> {
+    FORMAT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +90,25 @@ impl FormatSubtype {
             Some(Self::H264)
         } else {
             None
+        }
+    }
+
+    /// 配置持久化用：subtype → u8
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::Mjpeg => 0,
+            Self::Yuy2 => 1,
+            Self::H264 => 2,
+        }
+    }
+
+    /// 配置加载用：u8 → subtype
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Mjpeg),
+            1 => Some(Self::Yuy2),
+            2 => Some(Self::H264),
+            _ => None,
         }
     }
 }
@@ -149,20 +193,19 @@ struct SharedState {
     camera_control: Mutex<Option<IAMCameraControl>>,
     preview_tx: Sender<Arc<Vec<u8>>>,
     /// preview 队列的 clone，切换格式时用于 drain 掉切换前积压的旧帧。
-    /// crossbeam 的 Receiver clone 会共享消息，drain 时消费掉的帧不再进解码线程。
     preview_rx_for_drain: Receiver<Arc<Vec<u8>>>,
     /// CaptureHandle 的 latest clone，切换时清空，让 UI 显示“等待首帧”
     latest: Arc<Mutex<Option<Arc<Frame>>>>,
-    /// 当前生效的采集尺寸。
-    /// 由控制线程在 SetCurrentMediaType 成功后、drain preview 队列之前写入；
-    /// YUY2 解码线程每帧读取，用于检测尺寸变化并 resize 缓冲、丢弃切换前残留的旧帧。
-    /// MJPEG 从 JPEG 头读尺寸、H264 走解码器重协商，不使用这个字段。
+    /// 当前生效的采集尺寸。YUY2 / H264 解码线程每帧读取。
     current_dims: Arc<Mutex<(u32, u32)>>,
     recorder_tx: Arc<Mutex<Option<SyncSender<Arc<Vec<u8>>>>>>,
     capturing: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     last_ts: Mutex<i64>,
     send_drops: AtomicU64,
+    /// 采集错误标志。`OnReadSample` 收到 `hrstatus.is_err()` 时置位，
+    /// `CaptureHandle::stop()` 时清零。UI 侧读它显示「设备已断开」。
+    error_flag: Arc<AtomicBool>,
 
     switching: AtomicBool,
     in_callback: AtomicUsize,
@@ -192,13 +235,20 @@ impl IMFSourceReaderCallback_Impl for CaptureCallback_Impl {
     ) -> WinResult<()> {
         self.state.read_pending.store(false, Ordering::Release);
 
-        if hrstatus.is_err() || self.state.stop.load(Ordering::Relaxed) {
+        if hrstatus.is_err() {
+            // 驱动报错，设备可能已断开。置位标志让 UI 显示提示。
+            // 不续读，避免反复报错刷屏。
+            if !self.state.error_flag.load(Ordering::Relaxed) {
+                log::warn!("采集错误 0x{:08X}，设备可能已断开", hrstatus.0);
+                self.state.error_flag.store(true, Ordering::Relaxed);
+            }
             return Ok(());
         }
 
-        // 切换中：不处理帧、不续读，让控制线程独占 reader。
-        // 这里必须直接 return（不要续读），否则控制线程永远等不到
-        // read_pending == false。
+        if self.state.stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
         if self.state.switching.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -290,6 +340,25 @@ impl IMFSourceReaderCallback_Impl for CaptureCallback_Impl {
 pub type PreferredFormat = Option<(FormatSubtype, u32, u32, u32)>;
 
 // ---------------------------------------------------------------------------
+// 异步切换状态
+// ---------------------------------------------------------------------------
+
+struct PendingSwitchState {
+    target_idx: usize,
+    reply_rx: std::sync::mpsc::Receiver<Result<(), String>>,
+    started_at: Instant,
+}
+
+/// `poll_switch` 的返回类型。
+/// - `Success(fmt)`：切换成功，`CaptureHandle` 的 `width/height/current_format_idx` 已更新
+/// - `Failed(e)`：切换失败或超时，`group_idx/fps_idx` 需要 UI 侧回滚
+#[derive(Clone, Debug)]
+pub enum SwitchOutcome {
+    Success(VideoFormat),
+    Failed(String),
+}
+
+// ---------------------------------------------------------------------------
 // CaptureHandle
 // ---------------------------------------------------------------------------
 
@@ -310,9 +379,10 @@ pub struct CaptureHandle {
     pub initial_properties: Vec<PropertyInfo>,
     pub current_format_idx: usize,
     pub current_subtype: FormatSubtype,
-    /// 与 SharedState 共享同一份「当前采集尺寸」，
-    /// set_format 成功后同步写入，保证对外暴露的 width/height 与解码线程一致。
     current_dims: Arc<Mutex<(u32, u32)>>,
+    pending_switch: Mutex<Option<PendingSwitchState>>,
+    /// 采集错误标志。与 `SharedState.error_flag` 是同一个 `Arc`。
+    error_flag: Arc<AtomicBool>,
 }
 
 impl CaptureHandle {
@@ -332,11 +402,10 @@ impl CaptureHandle {
         let capturing = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let frames = Arc::new(AtomicU64::new(0));
-        // 初始 (0, 0)，在 init_rx 收到实际尺寸后写入。
         let current_dims = Arc::new(Mutex::new((0u32, 0u32)));
+        let error_flag = Arc::new(AtomicBool::new(false));
 
         let (preview_tx, preview_rx) = bounded::<Arc<Vec<u8>>>(PREVIEW_QUEUE_CAP);
-        // 额外 clone 一份用于切换时 drain（crossbeam clone 共享消息）
         let preview_rx_for_drain = preview_rx.clone();
         let (control_tx, control_rx) = bounded::<ControlCommand>(16);
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<
@@ -356,6 +425,7 @@ impl CaptureHandle {
             stop: stop.clone(),
             last_ts: Mutex::new(0),
             send_drops: AtomicU64::new(0),
+            error_flag: error_flag.clone(),
             switching: AtomicBool::new(false),
             in_callback: AtomicUsize::new(0),
             read_pending: AtomicBool::new(false),
@@ -378,7 +448,6 @@ impl CaptureHandle {
             .map_err(|e| anyhow!("等待初始化超时: {}", e))?
             .map_err(|e| anyhow!("初始化失败: {}", e))?;
 
-        // 写入初始尺寸，解码线程启动后即可读到。
         *current_dims.lock().unwrap() = (w, h);
 
         log::info!(
@@ -397,7 +466,6 @@ impl CaptureHandle {
             let latest_c = latest.clone();
             let stop_c = stop.clone();
             let frames_c = frames.clone();
-            // 把 current_dims 的 clone 传进解码线程。
             let dims_c = current_dims.clone();
             let j = thread::Builder::new()
                 .name(format!("preview-decoder-{}", i))
@@ -450,6 +518,8 @@ impl CaptureHandle {
             current_format_idx,
             current_subtype: subtype,
             current_dims,
+            pending_switch: Mutex::new(None),
+            error_flag,
         })
     }
 
@@ -471,10 +541,18 @@ impl CaptureHandle {
         self.frames.load(Ordering::Relaxed)
     }
 
+    /// 是否有采集错误（设备断开）。UI 侧用于状态栏提示。
+    pub fn has_error(&self) -> bool {
+        self.error_flag.load(Ordering::Relaxed)
+    }
+
     pub fn stop(&mut self) {
+        let t0 = Instant::now();
         self.stop.store(true, Ordering::Relaxed);
+        self.error_flag.store(false, Ordering::Relaxed);
         self.detach_recorder();
         let _ = self.control_tx.try_send(ControlCommand::Quit);
+        log::info!("[TIMING] stop() 发 Quit: {:?}", t0.elapsed());
     }
 
     pub fn read_properties(&self) -> Vec<PropertyInfo> {
@@ -498,17 +576,88 @@ impl CaptureHandle {
             .map_err(|e| anyhow!("发送控制命令失败: {}", e))
     }
 
-    /// 热切换格式。
-    ///
-    /// 关键：**不再阻塞等待新帧到达**。只要 `SetCurrentMediaType` 成功即视为切换成功。
-    /// 原因：
-    /// - 部分驱动切换后 1.8s 才吐第一帧；
-    /// - H264 需要等 IDR 才能解码，切换后可能几秒内没有可解码帧；
-    /// - H264 解码 buffer 有 16 对齐 padding（2592x1952 vs 请求的 2592x1944），
-    ///   靠 Frame 尺寸做判据天然不可靠。
-    ///
-    /// 控制线程在切换时会 drain 掉 preview 队列里积压的旧帧并清空 latest，
-    /// 新帧到达后 UI 的 pump_texture 会自动接上。
+    /// 发起异步格式切换。只发送命令，不阻塞 UI 线程。
+    /// 完成后通过 `poll_switch` 获取结果。
+    pub fn request_format(&mut self, index: usize) -> std::result::Result<(), String> {
+        {
+            let g = self.pending_switch.lock().unwrap();
+            if g.is_some() {
+                return Err("上一次切换尚未完成".into());
+            }
+        }
+        let new_fmt = self
+            .available_formats
+            .get(index)
+            .ok_or_else(|| "格式索引越界".to_string())?
+            .clone();
+        if new_fmt.subtype != self.current_subtype {
+            return Err(format!(
+                "切换 {} -> {} 需要重新打开摄像头",
+                self.current_subtype.name(),
+                new_fmt.subtype.name()
+            ));
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.control_tx
+            .send(ControlCommand::SwitchFormat { index, reply: tx })
+            .map_err(|e| format!("发送切换命令失败: {}", e))?;
+        *self.pending_switch.lock().unwrap() = Some(PendingSwitchState {
+            target_idx: index,
+            reply_rx: rx,
+            started_at: Instant::now(),
+        });
+        Ok(())
+    }
+
+    /// 轮询异步切换结果。返回 `Some` 表示已完成（成功或失败）。
+    pub fn poll_switch(&mut self) -> Option<SwitchOutcome> {
+        let (target_idx, started_at, recv_result) = {
+            let g = self.pending_switch.lock().unwrap();
+            let state = g.as_ref()?;
+            (
+                state.target_idx,
+                state.started_at,
+                state.reply_rx.try_recv(),
+            )
+        };
+        match recv_result {
+            Ok(Ok(())) => {
+                *self.pending_switch.lock().unwrap() = None;
+                let fmt = self.available_formats.get(target_idx).cloned()?;
+                self.width = fmt.width;
+                self.height = fmt.height;
+                self.current_format_idx = target_idx;
+                *self.current_dims.lock().unwrap() = (fmt.width, fmt.height);
+                log::info!("[TIMING] 异步切换完成: {:?}", started_at.elapsed());
+                Some(SwitchOutcome::Success(fmt))
+            }
+            Ok(Err(e)) => {
+                *self.pending_switch.lock().unwrap() = None;
+                Some(SwitchOutcome::Failed(e))
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                if started_at.elapsed() > Duration::from_millis(SWITCH_REPLY_TIMEOUT_MS) {
+                    *self.pending_switch.lock().unwrap() = None;
+                    Some(SwitchOutcome::Failed("切换格式命令超时".into()))
+                } else {
+                    None
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                *self.pending_switch.lock().unwrap() = None;
+                Some(SwitchOutcome::Failed("控制线程已退出".into()))
+            }
+        }
+    }
+
+    /// 是否有切换正在进行中。UI 侧用于禁用格式/帧率下拉。
+    pub fn is_switching(&self) -> bool {
+        self.pending_switch.lock().unwrap().is_some()
+    }
+
+    /// 同步热切换格式。保留给特殊场景（测试、脚本）。
+    /// 正常 UI 流程请用 `request_format` + `poll_switch`。
+    #[allow(dead_code)]
     pub fn set_format(&mut self, index: usize) -> Result<VideoFormat> {
         let new_fmt = self
             .available_formats
@@ -534,8 +683,6 @@ impl CaptureHandle {
                 self.width = new_fmt.width;
                 self.height = new_fmt.height;
                 self.current_format_idx = index;
-                // 与控制线程写入同一份 Arc；控制线程已在 reply 前写入，
-                // 这里再写一次是幂等兜底，不产生日志。
                 *self.current_dims.lock().unwrap() = (new_fmt.width, new_fmt.height);
                 log::info!(
                     "格式切换成功: {} {}x{} @ {}fps（新帧将异步到达）",
@@ -554,13 +701,29 @@ impl CaptureHandle {
 
 impl Drop for CaptureHandle {
     fn drop(&mut self) {
+        let t_all = Instant::now();
         self.stop();
+
+        let t_ctrl = Instant::now();
         if let Some(j) = self._control_join.take() {
             let _ = j.join();
         }
+        log::info!(
+            "[TIMING] Drop: control thread join {:?}",
+            t_ctrl.elapsed()
+        );
+
+        let n = self._decode_joins.len();
+        let t_dec = Instant::now();
         for j in self._decode_joins.drain(..) {
             let _ = j.join();
         }
+        log::info!(
+            "[TIMING] Drop: {} 个解码线程 join {:?}",
+            n,
+            t_dec.elapsed()
+        );
+        log::info!("[TIMING] Drop 总计: {:?}", t_all.elapsed());
     }
 }
 
@@ -581,8 +744,9 @@ fn mf_control_loop(
         CoInitializeEx(None, COINIT_MULTITHREADED)
             .ok()
             .map_err(|e| anyhow!("CoInitializeEx 失败: {}", e))?;
-        MFStartup(MF_VERSION, MFSTARTUP_FULL)
-            .map_err(|e| anyhow!("MFStartup 失败: {}", e))?;
+        // 进程级只 MFStartup 一次，后续跨 subtype 切换跳过。
+        // 配对 MFShutdown 在 main.rs 进程退出时调 mf::shutdown()。
+        crate::mf::ensure_startup()?;
 
         let result = (|| -> Result<()> {
             let source = open_device_source(camera_index)?;
@@ -606,13 +770,30 @@ fn mf_control_loop(
             let reader: IMFSourceReader =
                 MFCreateSourceReaderFromMediaSource(&source, &attrs)?;
 
-            let (media_types, video_formats) = collect_formats(&reader)?;
+            // P6.4：格式列表缓存。同一摄像头运行期内不变，切换 reader 时跳过枚举。
+            let (media_types, video_formats) = {
+                let mut g = format_cache().lock().unwrap();
+                if let Some(cached) = g.get(&camera_index) {
+                    log::debug!(
+                        "设备暴露 {} 种格式（从缓存读取，跳过枚举）",
+                        cached.1.len()
+                    );
+                    let mts: Vec<IMFMediaType> =
+                        cached.0.iter().map(|s| s.0.clone()).collect();
+                    (mts, cached.1.clone())
+                } else {
+                    let (mts, vfs) = collect_formats(&reader)?;
+                    let send_mts: Vec<SendMediaType> =
+                        mts.iter().map(|m| SendMediaType(m.clone())).collect();
+                    g.insert(camera_index, (send_mts, vfs.clone()));
+                    (mts, vfs)
+                }
+            };
             if video_formats.is_empty() {
                 let _ = init_tx.send(Err("设备未暴露 MJPG/YUY2/H264 中任一种格式".into()));
                 return Err(anyhow!("设备未暴露任何支持的格式"));
             }
 
-            // 只在首次打开该摄像头时打印完整格式列表，避免切换时刷屏
             if should_log_formats(camera_index) {
                 log::info!("设备暴露 {} 种格式:", video_formats.len());
                 for (i, f) in video_formats.iter().enumerate() {
@@ -635,15 +816,27 @@ fn mf_control_loop(
                     }) {
                         Some(i) => i,
                         None => {
-                            let msg = format!(
-                                "设备不支持目标格式 {} {}x{} @ {}fps",
+                            // preferred 指定的格式该设备不支持。
+                            // 场景：配置里存的是同型号另一台设备的格式，换设备后不匹配。
+                            // 回退到第一个 MJPEG 格式，保证用户至少能看到画面，
+                            // 而不是「打开失败」一片空白。
+                            let fallback = video_formats
+                                .iter()
+                                .position(|f| f.subtype == FormatSubtype::Mjpeg)
+                                .unwrap_or(0);
+                            let fallback_label = video_formats
+                                .get(fallback)
+                                .map(|f| f.label())
+                                .unwrap_or_default();
+                            log::warn!(
+                                "设备不支持目标格式 {} {}x{} @ {}fps，回退到默认: {}",
                                 sub.name(),
                                 w,
                                 h,
-                                fps
+                                fps,
+                                fallback_label
                             );
-                            let _ = init_tx.send(Err(msg.clone()));
-                            return Err(anyhow!("{}", msg));
+                            fallback
                         }
                     }
                 }
@@ -711,9 +904,6 @@ fn mf_control_loop(
 
             *shared.reader.lock().unwrap() = Some(reader);
 
-            // video_formats 马上要被 move 进 init_tx，
-            // SwitchFormat 分支只需要每个格式的尺寸来更新 shared.current_dims，
-            // 先抽成 (w, h) 表，避免 clone 整个 Vec。
             let switch_dims: Vec<(u32, u32)> = video_formats
                 .iter()
                 .map(|f| (f.width, f.height))
@@ -775,10 +965,8 @@ fn mf_control_loop(
                         let result: Result<(), String> = if let Some(mt) =
                             media_types.get(index)
                         {
-                            // 1) 进入切换模式：回调开头会直接 return，不处理帧也不续读
                             shared.switching.store(true, Ordering::Release);
 
-                            // 2) 等所有正在处理帧的回调退出
                             let deadline =
                                 Instant::now() + Duration::from_millis(SWITCH_SETTLE_TIMEOUT_MS);
                             while shared.in_callback.load(Ordering::Acquire) > 0
@@ -787,7 +975,6 @@ fn mf_control_loop(
                                 thread::sleep(Duration::from_millis(2));
                             }
 
-                            // 3) 等挂起的 ReadSample 回调返回
                             let deadline =
                                 Instant::now() + Duration::from_millis(SWITCH_SETTLE_TIMEOUT_MS);
                             while shared.read_pending.load(Ordering::Acquire)
@@ -796,7 +983,6 @@ fn mf_control_loop(
                                 thread::sleep(Duration::from_millis(2));
                             }
 
-                            // 4) 独占 reader 做 SetCurrentMediaType
                             let rv = {
                                 let reader_guard = shared.reader.lock().unwrap();
                                 match reader_guard.as_ref() {
@@ -807,7 +993,6 @@ fn mf_control_loop(
                                         let _ = r.SetStreamSelection(stream_idx, BOOL(1));
 
                                         if set_rv.is_ok() {
-                                            // 验证驱动实际接受的类型（仅日志，不改变结果）
                                             match r.GetCurrentMediaType(stream_idx) {
                                                 Ok(actual) => {
                                                     let actual_size = actual
@@ -839,22 +1024,9 @@ fn mf_control_loop(
                                 }
                             };
 
-                            // 5) 先退出切换模式，再启动 ReadSample
                             shared.switching.store(false, Ordering::Release);
 
-                            // 6) 成功时：
-                            //    a) 更新共享尺寸（必须在 drain 之前，让解码线程立即切换到新 expected）
-                            //    b) drain preview 队列（丢掉切换前积压的旧帧）
-                            //    c) 清空 latest（UI 侧显示“等待首帧”）
-                            //    d) 重启 ReadSample
                             if rv.is_ok() {
-                                // 先更新尺寸。解码线程读到新尺寸后，
-                                // 队列里残留的旧尺寸帧会因长度不匹配被丢弃。
-                                //
-                                // 尺寸切换日志只在控制线程打：控制线程只有一条，
-                                // 天然去重，不会出现「每个解码线程各打一次」。
-                                // 仅 YUY2 需要这条日志——MJPEG 从 JPEG 头读尺寸、
-                                // H264 走解码器重协商，都不依赖 current_dims。
                                 if let Some(&(dw, dh)) = switch_dims.get(index) {
                                     let old = {
                                         let mut g = shared.current_dims.lock().unwrap();
@@ -918,7 +1090,8 @@ fn mf_control_loop(
             Ok(())
         })();
 
-        let _ = MFShutdown();
+        // 不在此处 MFShutdown。进程级配对由 main.rs 退出时调 mf::shutdown() 完成。
+        // 跨 subtype 切换每次省 200ms。
         result
     }
 }
@@ -1141,8 +1314,6 @@ fn decode_loop(
         FormatSubtype::Mjpeg => decode_mjpeg(rx, latest, stop, frames),
         FormatSubtype::Yuy2 => decode_yuy2(rx, latest, stop, frames, current_dims),
         FormatSubtype::H264 => {
-            // 初始可见尺寸从 current_dims 读（start_with_format 里已写入）。
-            // 之后热切换分辨率时，run 内部每帧从同一个 Arc 读新值。
             let (iw, ih) = *current_dims.lock().unwrap();
             if let Err(e) = crate::h264_preview::run(
                 rx,
@@ -1200,21 +1371,6 @@ fn decode_mjpeg(
     }
 }
 
-/// YUY2 解码。
-///
-/// 尺寸不再在构造时固定，而是每帧从 `current_dims` 读取。
-/// 热切换（同 subtype、跨分辨率）后控制线程会更新 `current_dims`，
-/// 本线程下一帧就能感知到，`resize` 缓冲并继续工作。
-///
-/// 尺寸切换日志由控制线程统一打（控制线程只有一条，天然去重），
-/// 本函数不再输出，避免 DECODER_THREADS 个线程各打一次。
-///
-/// 长度判据：
-/// - `raw.len() < expected`：切换前残留的旧小尺寸帧，或异常帧，丢弃。
-/// - `raw.len() > expected + 一行`：切换前残留的旧大尺寸帧，丢弃。
-///   否则用新 expected 截断旧大帧会得到一帧错乱画面。
-/// - 落在 `[expected, expected + 一行]`：正常帧（允许驱动加少量行尾 padding），
-///   截取前 `expected` 字节交给转换函数。
 fn decode_yuy2(
     rx: Receiver<Arc<Vec<u8>>>,
     latest: Arc<Mutex<Option<Arc<Frame>>>>,
@@ -1233,11 +1389,8 @@ fn decode_yuy2(
             Err(_) => continue,
         };
 
-        // 每帧读共享尺寸：热切换成功后控制线程写入新值，
-        // 这里下一帧就能感知到。日志由控制线程统一打。
         let (cur_w, cur_h) = *current_dims.lock().unwrap();
         if cur_w == 0 || cur_h == 0 {
-            // 尚未初始化（理论上不会发生），丢弃等下一帧。
             continue;
         }
         if (cur_w, cur_h) != (w, h) {
@@ -1247,7 +1400,6 @@ fn decode_yuy2(
             rgb_work.resize(w as usize * h as usize * 3, 0);
         }
 
-        // 长度判据见函数文档注释。
         let line_bytes = w as usize * 2;
         if raw.len() < expected || raw.len() > expected + line_bytes {
             continue;

@@ -1,31 +1,38 @@
 ﻿[package]
 name = "camcap"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Rust AMCap-style webcam capture tool (preview / snapshot / record)"
+description = "AMCap-style camera preview/snapshot/recording tool for Windows"
+repository = "https://github.com/msxyy/Camcap"
 license = "MIT"
+keywords = ["camera", "webcam", "media-foundation", "directshow"]
+categories = ["multimedia::video"]
 
 [dependencies]
-anyhow = "1.0"
+anyhow = "1"
 chrono = "0.4"
 crossbeam-channel = "0.5"
-eframe = "0.29"
+eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
 egui = "0.29"
 env_logger = "0.11"
-image = { version = "0.25", features = ["jpeg", "png", "bmp"] }
+image = "0.25"
 log = "0.4"
-zune-jpeg = { version = "0.4.21", features = ["x86"] }
-zune-core = "0.4.12"
 muxide = "0.2"
+zune-core = "0.4"
+zune-jpeg = "0.4"
 
-[target.'cfg(windows)'.dependencies]
+# 配置持久化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 windows = { version = "0.58", features = [
-    "implement",
+    "implement",   # #[implement] 宏必需，启用 COM 接口 _Impl trait 生成
     "Win32_Foundation",
-    "Win32_Media_MediaFoundation",
     "Win32_Media_DirectShow",
+    "Win32_Media_MediaFoundation",
     "Win32_System_Com",
 ] }
+# #[implement] 宏展开后引用 ::windows_core，必须显式依赖
 windows-core = "0.58"
 
 [profile.release]

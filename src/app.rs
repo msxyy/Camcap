@@ -1,24 +1,62 @@
 use crate::camera::list_cameras;
 use crate::capture::{
-    CaptureHandle, FormatSubtype, PropertyInfo, PropertyKind, VideoFormat,
+    CaptureHandle, FormatSubtype, PropertyInfo, PropertyKind, SwitchOutcome, VideoFormat,
 };
+use crate::config::{AppConfig, PreferredFormatSave};
 use crate::photo;
 use crate::recorder::RecorderHandle;
 use eframe::egui;
 use egui::{ColorImage, Key, TextureHandle, TextureOptions, ViewportCommand};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 const TEXTURE_MIN_INTERVAL: Duration = Duration::from_millis(20);
+const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+const HOTPLUG_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const PURE_HINT_DURATION: Duration = Duration::from_secs(3);
+const PURE_HINT_FADE_DURATION: f32 = 0.5;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// 设备条目。`link` 是 USB 端口级唯一的 SymbolicLink。
+#[derive(Clone, Debug)]
+struct CameraEntry {
+    index: u32,
+    name: String,
+    link: String,
+}
+
+/// 后台自动打开线程回传给 UI 的结果。
+/// `Some` 表示一个 slot 的打开结果，`None` 表示后台线程全部完成（sentinel）。
+struct AutoOpenResult {
+    slot_index: usize,
+    entry: CameraEntry,
+    result: Result<CaptureHandle, String>,
+}
+
+/// 提取 SymbolicLink 里的 USB 端口哈希段（`7&xxxxxxxx`）用于 UI 显示。
+fn short_link(link: &str) -> String {
+    if let Some(pos) = link.find("#7&") {
+        let start = pos + 3;
+        if let Some(end) = link[start..].find('&') {
+            return format!("7&{}", &link[start..start + end]);
+        }
+        return format!("7&{}", &link[start..]);
+    }
+    if link.len() >= 8 {
+        link[link.len() - 8..].to_string()
+    } else {
+        link.to_string()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DisplayMode {
     Dual,
     SingleA,
     SingleB,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CompareLayout {
     Horizontal,
     Vertical,
@@ -59,6 +97,18 @@ fn setup_fonts(ctx: &egui::Context) {
     }
     ctx.set_fonts(fonts);
     log::info!("[TIMING] setup_fonts: {:?}", t0.elapsed());
+}
+
+fn fmt_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{:02}:{:02}:{:02}", h, m, s)
+    } else {
+        format!("{:02}:{:02}", m, s)
+    }
 }
 
 struct Fps {
@@ -197,6 +247,12 @@ struct CameraSlot {
     group_idx: usize,
     fps_idx: usize,
     pending_switch: bool,
+    preferred_format: Option<(FormatSubtype, u32, u32, u32)>,
+    config_dirty: bool,
+    recording_started: Option<Instant>,
+    connected_name: Option<String>,
+    connected_link: Option<String>,
+    user_closed: bool,
 }
 
 impl CameraSlot {
@@ -216,6 +272,12 @@ impl CameraSlot {
             group_idx: 0,
             fps_idx: 0,
             pending_switch: false,
+            preferred_format: None,
+            config_dirty: false,
+            recording_started: None,
+            connected_name: None,
+            connected_link: None,
+            user_closed: false,
         }
     }
 
@@ -225,33 +287,65 @@ impl CameraSlot {
     fn is_recording(&self) -> bool {
         self.recorder.is_some()
     }
+    fn is_switching(&self) -> bool {
+        self.capture.as_ref().map(|c| c.is_switching()).unwrap_or(false)
+    }
+    fn has_error(&self) -> bool {
+        self.capture.as_ref().map(|c| c.has_error()).unwrap_or(false)
+    }
 
-    fn open(&mut self, camera_index: u32) -> Result<(u32, u32), String> {
-        self.open_with_preferred(camera_index, None)
+    fn recording_elapsed(&self) -> Option<Duration> {
+        if self.recorder.is_some() {
+            self.recording_started.map(|t| t.elapsed())
+        } else {
+            None
+        }
+    }
+
+    /// 把一个已经创建好的 `CaptureHandle` 安装到 slot 上。
+    /// 从 `open_with_preferred` 的 `Ok` 分支抽出来，供异步自动打开路径复用。
+    fn install_capture(&mut self, entry: &CameraEntry, c: CaptureHandle) {
+        let (w, h) = (c.width, c.height);
+        self.groups = build_groups(&c.available_formats);
+        let (gi, fi) = locate_format(&self.groups, c.current_format_idx);
+        self.group_idx = gi;
+        self.fps_idx = fi;
+        self.pending_switch = false;
+        let actual_fps = c
+            .available_formats
+            .get(c.current_format_idx)
+            .map(|f| f.fps)
+            .unwrap_or(30);
+        self.preferred_format = Some((c.current_subtype, w, h, actual_fps));
+        self.config_dirty = true;
+        self.capture = Some(c);
+        self.fps = Fps::new();
+        self.last_rendered_seq = 0;
+        self.last_texture_update = Instant::now();
+        self.props = Vec::new();
+        self.props_loaded = false;
+        self.show_props = false;
+        self.connected_name = Some(entry.name.clone());
+        self.connected_link = Some(entry.link.clone());
+        self.user_closed = false;
+    }
+
+    fn open(&mut self, entry: &CameraEntry) -> Result<(u32, u32), String> {
+        let preferred = self.preferred_format;
+        self.open_with_preferred(entry, preferred)
     }
 
     fn open_with_preferred(
         &mut self,
-        camera_index: u32,
+        entry: &CameraEntry,
         preferred: Option<(FormatSubtype, u32, u32, u32)>,
     ) -> Result<(u32, u32), String> {
         let t0 = Instant::now();
         self.close();
-        match CaptureHandle::start_with_format(camera_index, preferred) {
+        match CaptureHandle::start_with_format(entry.index, preferred) {
             Ok(c) => {
                 let (w, h) = (c.width, c.height);
-                self.groups = build_groups(&c.available_formats);
-                let (gi, fi) = locate_format(&self.groups, c.current_format_idx);
-                self.group_idx = gi;
-                self.fps_idx = fi;
-                self.pending_switch = false;
-                self.capture = Some(c);
-                self.fps = Fps::new();
-                self.last_rendered_seq = 0;
-                self.last_texture_update = Instant::now();
-                self.props = Vec::new();
-                self.props_loaded = false;
-                self.show_props = false;
+                self.install_capture(entry, c);
                 log::info!("[TIMING] open_with_preferred 总计: {:?}", t0.elapsed());
                 Ok((w, h))
             }
@@ -285,9 +379,13 @@ impl CameraSlot {
         self.fps_idx = 0;
         self.pending_switch = false;
         self.last_texture_update = Instant::now();
+        self.recording_started = None;
     }
 
     fn reconcile(&mut self) {
+        if self.pending_switch {
+            return;
+        }
         if let Some(cap) = self.capture.as_ref() {
             let cur_idx = cap.current_format_idx;
             let (gi, fi) = locate_format(&self.groups, cur_idx);
@@ -296,16 +394,42 @@ impl CameraSlot {
                 .get(self.group_idx)
                 .and_then(|g| g.fps_to_idx.get(self.fps_idx).copied())
                 != Some(cur_idx);
-            if need_sync && self.pending_switch {
+            if need_sync {
                 self.group_idx = gi;
                 self.fps_idx = fi;
-                self.pending_switch = false;
-                log::warn!(
-                    "UI 与驱动状态不一致，已回滚到实际格式索引 {}",
-                    cur_idx
-                );
+                log::warn!("UI 与驱动状态不一致，已回滚到实际格式索引 {}", cur_idx);
             }
         }
+    }
+
+    fn poll_switch(&mut self) -> Option<SwitchOutcome> {
+        let cap = self.capture.as_mut()?;
+        let outcome = cap.poll_switch()?;
+        match &outcome {
+            SwitchOutcome::Success(f) => {
+                self.pending_switch = false;
+                self.preferred_format = Some((f.subtype, f.width, f.height, f.fps));
+                self.config_dirty = true;
+                self.last_rendered_seq = 0;
+                self.last_texture_update = Instant::now();
+                self.props_loaded = false;
+                if let Some(cap) = self.capture.as_ref() {
+                    let (gi, fi) = locate_format(&self.groups, cap.current_format_idx);
+                    self.group_idx = gi;
+                    self.fps_idx = fi;
+                }
+            }
+            SwitchOutcome::Failed(_) => {
+                self.pending_switch = false;
+                if let Some(cap) = self.capture.as_ref() {
+                    let cur_idx = cap.current_format_idx;
+                    let (gi, fi) = locate_format(&self.groups, cur_idx);
+                    self.group_idx = gi;
+                    self.fps_idx = fi;
+                }
+            }
+        }
+        Some(outcome)
     }
 
     fn toggle_recording(
@@ -318,6 +442,7 @@ impl CameraSlot {
                 c.detach_recorder();
             }
             r.stop();
+            self.recording_started = None;
             return Ok(None);
         }
 
@@ -326,6 +451,13 @@ impl CameraSlot {
         };
         let (w, h) = (cap.width, cap.height);
         let subtype = cap.current_subtype;
+
+        let actual_fps = cap
+            .available_formats
+            .get(cap.current_format_idx)
+            .map(|f| f.fps)
+            .filter(|&f| f > 0)
+            .unwrap_or(30);
 
         let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
         let ext = match subtype {
@@ -342,10 +474,12 @@ impl CameraSlot {
             tag, tag_codec, ts, ext
         ));
 
-        let (rec, tx) = RecorderHandle::start(path.clone(), w, h, 30, 30, subtype)
-            .map_err(|e| e.to_string())?;
+        let (rec, tx) =
+            RecorderHandle::start(path.clone(), w, h, actual_fps, 30, subtype)
+                .map_err(|e| e.to_string())?;
         cap.attach_recorder(tx);
         self.recorder = Some(rec);
+        self.recording_started = Some(Instant::now());
         Ok(Some(path))
     }
 
@@ -390,11 +524,13 @@ impl CameraSlot {
         }
     }
 
-    /// 短格式标签：`MJPEG 2592x1944 @ 30`
     fn short_format_label(&self) -> String {
         let Some(cap) = self.capture.as_ref() else {
             return "未打开".to_string();
         };
+        if cap.is_switching() {
+            return "切换中…".to_string();
+        }
         if let Some(f) = cap.available_formats.get(cap.current_format_idx) {
             format!(
                 "{} {}x{} @ {}",
@@ -415,7 +551,7 @@ impl CameraSlot {
 
 fn apply_format(
     slot: &mut CameraSlot,
-    cameras: &[(u32, String)],
+    cameras: &[CameraEntry],
     tag: &str,
     status: &mut String,
     error: &mut Option<String>,
@@ -427,6 +563,12 @@ fn apply_format(
         slot.fps_idx = prev_fps_idx;
         return;
     };
+    if cap.is_switching() {
+        slot.group_idx = prev_group_idx;
+        slot.fps_idx = prev_fps_idx;
+        *error = Some(format!("[{}] 上一次切换尚未完成，请稍候", tag));
+        return;
+    }
     let Some(group) = slot.groups.get(slot.group_idx).cloned() else {
         slot.group_idx = prev_group_idx;
         slot.fps_idx = prev_fps_idx;
@@ -452,61 +594,63 @@ fn apply_format(
 
     if same_subtype {
         log::info!(
-            "[{}] 尝试热切换: cur_idx={} target_idx={} target={}x{}@{}",
-            tag, cur_idx, target_idx, target_w, target_h, target_fps
+            "[{}] 尝试热切换（异步）: cur_idx={} target_idx={} target={}x{}@{}",
+            tag,
+            cur_idx,
+            target_idx,
+            target_w,
+            target_h,
+            target_fps
         );
-        let t_hot = Instant::now();
         slot.pending_switch = true;
-        let set_result = slot.capture.as_mut().map(|c| c.set_format(target_idx));
-        match set_result {
-            Some(Ok(f)) => {
-                log::info!(
-                    "[TIMING] [{}] 热切换成功: {:?}",
-                    tag,
-                    t_hot.elapsed()
-                );
-                *status = format!("[{}] 格式已切换: {}", tag, f.label());
-                slot.last_rendered_seq = 0;
-                slot.last_texture_update = Instant::now();
-                slot.props_loaded = false;
-                slot.pending_switch = false;
+        let r = slot.capture.as_mut().map(|c| c.request_format(target_idx));
+        match r {
+            Some(Ok(())) => {
+                *status = format!("[{}] 正在切换格式…", tag);
                 *error = None;
                 return;
             }
             Some(Err(e)) => {
-                log::warn!(
-                    "[TIMING] [{}] 热切换失败（{:?}），回退到重启: {}",
-                    tag,
-                    t_hot.elapsed(),
-                    e
-                );
-            }
-            None => {
+                log::warn!("[{}] 发起热切换失败: {}", tag, e);
+                slot.pending_switch = false;
                 slot.group_idx = prev_group_idx;
                 slot.fps_idx = prev_fps_idx;
+                *error = Some(format!("[{}] 切换失败: {}", tag, e));
+                return;
+            }
+            None => {
                 slot.pending_switch = false;
+                slot.group_idx = prev_group_idx;
+                slot.fps_idx = prev_fps_idx;
                 return;
             }
         }
     }
 
-    let cam_idx = cameras.get(slot.selected).map(|(i, _)| *i).unwrap_or(0);
+    let Some(entry) = cameras.get(slot.selected).cloned() else {
+        slot.group_idx = prev_group_idx;
+        slot.fps_idx = prev_fps_idx;
+        return;
+    };
     let preferred = Some((target_subtype, target_w, target_h, target_fps));
     log::info!(
         "[{}] 重启 reader: target={} {}x{}@{}",
-        tag, target_subtype.name(), target_w, target_h, target_fps
+        tag,
+        target_subtype.name(),
+        target_w,
+        target_h,
+        target_fps
     );
     let t_restart = Instant::now();
-    match slot.open_with_preferred(cam_idx, preferred) {
+    match slot.open_with_preferred(&entry, preferred) {
         Ok((w, h)) => {
-            log::info!(
-                "[TIMING] [{}] 重启成功: {:?}",
-                tag,
-                t_restart.elapsed()
-            );
+            log::info!("[TIMING] [{}] 重启成功: {:?}", tag, t_restart.elapsed());
             *status = format!(
                 "[{}] 已重启为 {} ({}x{})",
-                tag, target_subtype.name(), w, h
+                tag,
+                target_subtype.name(),
+                w,
+                h
             );
             *error = None;
         }
@@ -529,7 +673,7 @@ fn apply_format(
 // ---------------------------------------------------------------------------
 
 pub struct CamCapApp {
-    cameras: Vec<(u32, String)>,
+    cameras: Vec<CameraEntry>,
     slots: [CameraSlot; 2],
     status: String,
     error: Option<String>,
@@ -537,22 +681,91 @@ pub struct CamCapApp {
     display_mode: DisplayMode,
     compare_layout: CompareLayout,
     pure_compare: bool,
+    pure_hint_until: Option<Instant>,
+    config: AppConfig,
+    config_dirty: bool,
+    last_save: Instant,
+    current_window_size: Option<[f32; 2]>,
+    known_device_links: Vec<String>,
+    last_poll: Instant,
+    /// 启动时待自动打开的摄像头列表（slot_index + 设备）。
+    /// `new` 里填充，`update` 第一帧取走启动后台线程。
+    pending_auto_open: Vec<(usize, CameraEntry)>,
+    /// 后台自动打开线程的结果接收端。
+    /// `Some(result)` 表示一个 slot 的打开结果，`None` 表示后台线程全部完成。
+    auto_open_rx: Receiver<Option<AutoOpenResult>>,
+    /// 后台自动打开线程的结果发送端。clone 给后台线程。
+    auto_open_tx: Sender<Option<AutoOpenResult>>,
+    /// 后台自动打开是否还在进行中。收到 sentinel 后置 false。
+    auto_open_in_progress: bool,
 }
 
 impl CamCapApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, cfg: AppConfig) -> Self {
         setup_fonts(&cc.egui_ctx);
         let output_dir = std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("camcap-output");
         let _ = std::fs::create_dir_all(&output_dir);
 
-        let cameras: Vec<(u32, String)> = match list_cameras() {
-            Ok(list) => list.into_iter().map(|c| (c.index, c.name)).collect(),
+        let cameras: Vec<CameraEntry> = match list_cameras() {
+            Ok(list) => list
+                .into_iter()
+                .map(|c| CameraEntry {
+                    index: c.index,
+                    name: c.name,
+                    link: c.symbolic_link,
+                })
+                .collect(),
             Err(e) => {
                 log::error!("枚举摄像头失败: {}", e);
                 Vec::new()
             }
+        };
+
+        let mut slots = [CameraSlot::new(), CameraSlot::new()];
+        for (slot, sc) in slots.iter_mut().zip([&cfg.slot_a, &cfg.slot_b]) {
+            let found = if !sc.symbolic_link.is_empty() {
+                cameras.iter().position(|c| c.link == sc.symbolic_link)
+            } else {
+                None
+            }
+            .or_else(|| {
+                if !sc.camera_name.is_empty() {
+                    cameras.iter().position(|c| c.name == sc.camera_name)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| cameras.iter().position(|c| c.index == sc.camera_index));
+
+            if let Some(idx) = found {
+                slot.selected = idx;
+            }
+            if let Some(p) = sc.preferred_format {
+                if let Some(sub) = FormatSubtype::from_u8(p.subtype) {
+                    slot.preferred_format = Some((sub, p.width, p.height, p.fps));
+                }
+            }
+        }
+
+        // 启动自动打开：按当前设备数量分配，slot A 用 cameras[0]，slot B 用 cameras[1]。
+        // **改为后台异步打开**，`new` 里只记录待打开列表，实际打开在 `update` 第一帧
+        // 启动后台线程。这样 UI 先出现（~250ms），画面在 1s 内异步填充，不再阻塞启动。
+        let mut pending_auto_open = Vec::new();
+        for (si, entry) in cameras.iter().enumerate().take(2) {
+            pending_auto_open.push((si, entry.clone()));
+        }
+        let (auto_open_tx, auto_open_rx) = std::sync::mpsc::channel();
+
+        let display_mode = match cfg.display_mode {
+            1 => DisplayMode::SingleA,
+            2 => DisplayMode::SingleB,
+            _ => DisplayMode::Dual,
+        };
+        let compare_layout = match cfg.compare_layout {
+            1 => CompareLayout::Vertical,
+            _ => CompareLayout::Horizontal,
         };
 
         let status = if cameras.is_empty() {
@@ -561,24 +774,224 @@ impl CamCapApp {
             format!("检测到 {} 个摄像头", cameras.len())
         };
 
+        log::info!(
+            "配置已应用: display_mode={:?}, A.cam={:?}, B.cam={:?}",
+            display_mode,
+            slots[0].preferred_format,
+            slots[1].preferred_format
+        );
+
+        let known_device_links: Vec<String> =
+            cameras.iter().map(|c| c.link.clone()).collect();
+
         Self {
             cameras,
-            slots: [CameraSlot::new(), CameraSlot::new()],
+            slots,
             status,
             error: None,
             output_dir,
-            display_mode: DisplayMode::Dual,
-            compare_layout: CompareLayout::Horizontal,
+            display_mode,
+            compare_layout,
             pure_compare: false,
+            pure_hint_until: None,
+            config: cfg,
+            config_dirty: false,
+            last_save: Instant::now(),
+            current_window_size: None,
+            known_device_links,
+            last_poll: Instant::now(),
+            pending_auto_open,
+            auto_open_rx,
+            auto_open_tx,
+            auto_open_in_progress: false,
         }
     }
 
+    fn toggle_pure_compare(&mut self) {
+        self.pure_compare = !self.pure_compare;
+        if self.pure_compare {
+            self.pure_hint_until = Some(Instant::now() + PURE_HINT_DURATION);
+        } else {
+            self.pure_hint_until = None;
+        }
+    }
+
+    fn pure_hint_alpha(&self) -> f32 {
+        let Some(t) = self.pure_hint_until else {
+            return 0.0;
+        };
+        let now = Instant::now();
+        if now >= t {
+            return 0.0;
+        }
+        let remaining = t.duration_since(now).as_secs_f32();
+        if remaining < PURE_HINT_FADE_DURATION {
+            remaining / PURE_HINT_FADE_DURATION
+        } else {
+            1.0
+        }
+    }
+
+    fn any_recording(&self) -> bool {
+        self.slots[0].is_recording() || self.slots[1].is_recording()
+    }
+
+    fn poll_hotplug(&mut self) {
+        if self.last_poll.elapsed() < HOTPLUG_POLL_INTERVAL {
+            return;
+        }
+        self.last_poll = Instant::now();
+
+        let Ok(list) = list_cameras() else {
+            return;
+        };
+        let new_links: Vec<String> = list.iter().map(|c| c.symbolic_link.clone()).collect();
+        if new_links == self.known_device_links {
+            return;
+        }
+
+        let removed: Vec<String> = self
+            .known_device_links
+            .iter()
+            .filter(|l| !new_links.contains(l))
+            .cloned()
+            .collect();
+        let added: Vec<String> = new_links
+            .iter()
+            .filter(|l| !self.known_device_links.contains(l))
+            .cloned()
+            .collect();
+
+        log::info!(
+            "热插拔检测: 拔出 {} 个, 插入 {} 个",
+            removed.len(),
+            added.len()
+        );
+
+        self.cameras = list
+            .into_iter()
+            .map(|c| CameraEntry {
+                index: c.index,
+                name: c.name,
+                link: c.symbolic_link,
+            })
+            .collect();
+        let cameras_snapshot = self.cameras.clone();
+
+        for slot in self.slots.iter_mut() {
+            if slot.user_closed {
+                if let Some(link) = &slot.connected_link {
+                    if removed.contains(link) {
+                        log::info!(
+                            "用户关闭的设备被拔出，清除关闭意图: {}",
+                            short_link(link)
+                        );
+                        slot.user_closed = false;
+                        slot.connected_link = None;
+                        slot.connected_name = None;
+                    }
+                }
+            }
+        }
+
+        for link in &added {
+            let Some(entry) = cameras_snapshot.iter().find(|c| c.link == *link) else {
+                continue;
+            };
+
+            let mut handled = false;
+            for slot in self.slots.iter_mut() {
+                if slot.capture.is_none() || !slot.has_error() {
+                    continue;
+                }
+                let link_match =
+                    slot.connected_link.as_deref() == Some(entry.link.as_str());
+                let name_match = !link_match
+                    && slot.connected_name.as_deref() == Some(entry.name.as_str());
+                if !link_match && !name_match {
+                    continue;
+                }
+                let preferred = slot.preferred_format;
+                match slot.open_with_preferred(entry, preferred) {
+                    Ok(_) => {
+                        if link_match {
+                            log::info!(
+                                "设备自动重连（link 匹配）: {}",
+                                entry.name
+                            );
+                        } else {
+                            log::info!(
+                                "设备自动重连（name 回退，可能换了 USB 口）: {}",
+                                entry.name
+                            );
+                        }
+                        handled = true;
+                    }
+                    Err(e) => log::warn!("设备自动重连失败: {}", e),
+                }
+                break;
+            }
+            if handled {
+                continue;
+            }
+
+            for slot in self.slots.iter_mut() {
+                let can_use = if slot.capture.is_some() {
+                    false
+                } else if !slot.user_closed {
+                    true
+                } else {
+                    slot.connected_link.as_deref() == Some(entry.link.as_str())
+                };
+                if !can_use {
+                    continue;
+                }
+                let preferred = slot.preferred_format;
+                match slot.open_with_preferred(entry, preferred) {
+                    Ok(_) => {
+                        log::info!("新设备自动打开: {}", entry.name);
+                    }
+                    Err(e) => log::warn!("新设备自动打开失败: {}", e),
+                }
+                break;
+            }
+        }
+
+        self.known_device_links = new_links;
+    }
+
     fn refresh_cameras(&mut self) {
+        let old_links: [Option<String>; 2] = [
+            self.cameras.get(self.slots[0].selected).map(|c| c.link.clone()),
+            self.cameras.get(self.slots[1].selected).map(|c| c.link.clone()),
+        ];
+
         match list_cameras() {
             Ok(list) => {
-                self.status = format!("检测到 {} 个摄像头", list.len());
-                self.cameras = list.into_iter().map(|c| (c.index, c.name)).collect();
+                self.cameras = list
+                    .into_iter()
+                    .map(|c| CameraEntry {
+                        index: c.index,
+                        name: c.name,
+                        link: c.symbolic_link,
+                    })
+                    .collect();
+                self.known_device_links =
+                    self.cameras.iter().map(|c| c.link.clone()).collect();
+
+                for (i, slot) in self.slots.iter_mut().enumerate() {
+                    let new_sel = old_links[i]
+                        .as_ref()
+                        .and_then(|link| {
+                            self.cameras.iter().position(|c| &c.link == link)
+                        })
+                        .unwrap_or(0);
+                    slot.selected = new_sel.min(self.cameras.len().saturating_sub(1));
+                }
+
+                self.status = format!("检测到 {} 个摄像头", self.cameras.len());
                 self.error = None;
+                self.config_dirty = true;
             }
             Err(e) => self.error = Some(format!("枚举失败: {}", e)),
         }
@@ -590,10 +1003,10 @@ impl CamCapApp {
             return;
         }
 
-        let (idx_a, name_a) = self.cameras[self.slots[0].selected].clone();
-        match self.slots[0].open(idx_a) {
+        let entry_a = self.cameras[self.slots[0].selected].clone();
+        match self.slots[0].open(&entry_a) {
             Ok((w, h)) => {
-                self.status = format!("[A] {} ({}x{})", name_a, w, h);
+                self.status = format!("[A] {} ({}x{})", entry_a.name, w, h);
                 self.error = None;
             }
             Err(e) => self.error = Some(e),
@@ -601,11 +1014,12 @@ impl CamCapApp {
 
         if self.cameras.len() > 1 && self.slots[1].selected == self.slots[0].selected {
             self.slots[1].selected = (self.slots[0].selected + 1) % self.cameras.len();
+            self.slots[1].config_dirty = true;
         }
-        let (idx_b, name_b) = self.cameras[self.slots[1].selected].clone();
-        match self.slots[1].open(idx_b) {
+        let entry_b = self.cameras[self.slots[1].selected].clone();
+        match self.slots[1].open(&entry_b) {
             Ok((w, h)) => {
-                self.status = format!("[B] {} ({}x{})", name_b, w, h);
+                self.status = format!("[B] {} ({}x{})", entry_b.name, w, h);
                 self.error = None;
             }
             Err(e) => self.error = Some(e),
@@ -615,8 +1029,86 @@ impl CamCapApp {
     fn close_both(&mut self) {
         for s in self.slots.iter_mut() {
             s.close();
+            s.user_closed = true;
         }
         self.status = "已全部关闭".into();
+    }
+
+    fn sync_config(&mut self) {
+        let cfg = &mut self.config;
+
+        let entry_a = self.cameras.get(self.slots[0].selected);
+        cfg.slot_a.camera_index = entry_a.map(|e| e.index).unwrap_or(0);
+        cfg.slot_a.camera_name = entry_a.map(|e| e.name.clone()).unwrap_or_default();
+        cfg.slot_a.symbolic_link = entry_a.map(|e| e.link.clone()).unwrap_or_default();
+        cfg.slot_a.preferred_format =
+            self.slots[0].preferred_format.map(|(s, w, h, f)| {
+                PreferredFormatSave {
+                    subtype: s.to_u8(),
+                    width: w,
+                    height: h,
+                    fps: f,
+                }
+            });
+
+        let entry_b = self.cameras.get(self.slots[1].selected);
+        cfg.slot_b.camera_index = entry_b.map(|e| e.index).unwrap_or(0);
+        cfg.slot_b.camera_name = entry_b.map(|e| e.name.clone()).unwrap_or_default();
+        cfg.slot_b.symbolic_link = entry_b.map(|e| e.link.clone()).unwrap_or_default();
+        cfg.slot_b.preferred_format =
+            self.slots[1].preferred_format.map(|(s, w, h, f)| {
+                PreferredFormatSave {
+                    subtype: s.to_u8(),
+                    width: w,
+                    height: h,
+                    fps: f,
+                }
+            });
+
+        cfg.display_mode = match self.display_mode {
+            DisplayMode::Dual => 0,
+            DisplayMode::SingleA => 1,
+            DisplayMode::SingleB => 2,
+        };
+        cfg.compare_layout = match self.compare_layout {
+            CompareLayout::Horizontal => 0,
+            CompareLayout::Vertical => 1,
+        };
+        if let Some(size) = self.current_window_size {
+            cfg.window_size = Some(size);
+        }
+    }
+
+    fn save_if_dirty(&mut self) {
+        let dirty = self.config_dirty
+            || self.slots[0].config_dirty
+            || self.slots[1].config_dirty;
+        if !dirty {
+            return;
+        }
+        if self.last_save.elapsed() < SAVE_DEBOUNCE {
+            return;
+        }
+        self.sync_config();
+        crate::config::save(&self.config);
+        self.config_dirty = false;
+        self.slots[0].config_dirty = false;
+        self.slots[1].config_dirty = false;
+        self.last_save = Instant::now();
+        log::trace!(
+            "配置已保存: mode={:?}, A.link={:?}, B.link={:?}",
+            self.display_mode,
+            self.config.slot_a.symbolic_link,
+            self.config.slot_b.symbolic_link
+        );
+    }
+}
+
+impl Drop for CamCapApp {
+    fn drop(&mut self) {
+        self.sync_config();
+        crate::config::save(&self.config);
+        log::info!("退出时已保存配置");
     }
 }
 
@@ -627,7 +1119,7 @@ impl CamCapApp {
 fn render_slot(
     ui: &mut egui::Ui,
     slot: &mut CameraSlot,
-    cameras: &[(u32, String)],
+    cameras: &[CameraEntry],
     tag: &str,
     output_dir: &Path,
     status: &mut String,
@@ -637,31 +1129,40 @@ fn render_slot(
 
     let is_open = slot.is_open();
     let is_recording = slot.is_recording();
+    let is_switching = slot.is_switching();
 
-    // ---------- 第一行：设备 / 格式 / 帧率 / 打开-关闭 / 参数 ----------
     ui.horizontal(|ui| {
-        // 摄像头
         let current_cam = cameras
             .get(slot.selected)
-            .map(|(_, n)| n.clone())
+            .map(|c| format!("{} [{}]", c.name, short_link(&c.link)))
             .unwrap_or_else(|| "无".into());
-        egui::ComboBox::from_id_salt(format!("combo-{}", tag))
-            .selected_text(current_cam)
-            .width(120.0)
-            .show_ui(ui, |ui| {
-                for (i, (_, name)) in cameras.iter().enumerate() {
-                    ui.selectable_value(&mut slot.selected, i, name);
-                }
-            });
 
-        // 格式/分辨率
+        let cam_resp = ui.add_enabled_ui(!is_recording, |ui| {
+            egui::ComboBox::from_id_salt(format!("combo-{}", tag))
+                .selected_text(current_cam)
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for (i, entry) in cameras.iter().enumerate() {
+                        let label =
+                            format!("{} [{}]", entry.name, short_link(&entry.link));
+                        if ui.selectable_value(&mut slot.selected, i, label).changed() {
+                            slot.config_dirty = true;
+                        }
+                    }
+                })
+                .response
+        });
+        if is_recording {
+            cam_resp.inner.on_hover_text("录制中无法切换设备，请先停止录制");
+        }
+
         let groups_snapshot: Vec<FormatGroup> = slot.groups.clone();
         let current_group_label = groups_snapshot
             .get(slot.group_idx)
             .map(|g| g.label())
             .unwrap_or_else(|| "—".into());
 
-        ui.add_enabled_ui(is_open && !is_recording, |ui| {
+        ui.add_enabled_ui(is_open && !is_recording && !is_switching, |ui| {
             let mut new_group_idx = slot.group_idx;
             egui::ComboBox::from_id_salt(format!("pin-combo-{}", tag))
                 .selected_text(current_group_label)
@@ -698,7 +1199,6 @@ fn render_slot(
             }
         });
 
-        // 帧率
         let fps_list: Vec<u32> = slot
             .groups
             .get(slot.group_idx)
@@ -706,50 +1206,57 @@ fn render_slot(
             .unwrap_or_default();
         let current_fps = fps_list.get(slot.fps_idx).copied().unwrap_or(0);
 
-        ui.add_enabled_ui(is_open && !is_recording && !fps_list.is_empty(), |ui| {
-            let mut new_fps_idx = slot.fps_idx;
-            egui::ComboBox::from_id_salt(format!("fps-combo-{}", tag))
-                .selected_text(if current_fps > 0 {
-                    format!("{}fps", current_fps)
-                } else {
-                    "—".to_string()
-                })
-                .width(64.0)
-                .show_ui(ui, |ui| {
-                    for (i, &f) in fps_list.iter().enumerate() {
-                        ui.selectable_value(&mut new_fps_idx, i, format!("{} fps", f));
-                    }
-                });
+        ui.add_enabled_ui(
+            is_open && !is_recording && !is_switching && !fps_list.is_empty(),
+            |ui| {
+                let mut new_fps_idx = slot.fps_idx;
+                egui::ComboBox::from_id_salt(format!("fps-combo-{}", tag))
+                    .selected_text(if current_fps > 0 {
+                        format!("{}fps", current_fps)
+                    } else {
+                        "—".to_string()
+                    })
+                    .width(64.0)
+                    .show_ui(ui, |ui| {
+                        for (i, &f) in fps_list.iter().enumerate() {
+                            ui.selectable_value(&mut new_fps_idx, i, format!("{} fps", f));
+                        }
+                    });
 
-            if new_fps_idx != slot.fps_idx {
-                let prev_group_idx = slot.group_idx;
-                let prev_fps_idx = slot.fps_idx;
-                slot.fps_idx = new_fps_idx;
-                apply_format(
-                    slot,
-                    cameras,
-                    tag,
-                    status,
-                    error,
-                    prev_group_idx,
-                    prev_fps_idx,
-                );
-            }
-        });
+                if new_fps_idx != slot.fps_idx {
+                    let prev_group_idx = slot.group_idx;
+                    let prev_fps_idx = slot.fps_idx;
+                    slot.fps_idx = new_fps_idx;
+                    apply_format(
+                        slot,
+                        cameras,
+                        tag,
+                        status,
+                        error,
+                        prev_group_idx,
+                        prev_fps_idx,
+                    );
+                }
+            },
+        );
 
-        // 打开/关闭 合一
         let toggle_label = if is_open { "关闭" } else { "打开" };
-        if ui
-            .add(egui::Button::new(toggle_label).min_size(egui::vec2(50.0, 24.0)))
-            .clicked()
-        {
+        let close_resp = ui.add_enabled(
+            !is_recording,
+            egui::Button::new(toggle_label).min_size(egui::vec2(50.0, 24.0)),
+        );
+        if is_open && is_recording {
+            close_resp.clone().on_hover_text("录制中无法关闭，请先停止录制");
+        }
+        if close_resp.clicked() {
             if is_open {
                 slot.close();
+                slot.user_closed = true;
                 *status = format!("[{}] 已关闭", tag);
-            } else if let Some((idx, name)) = cameras.get(slot.selected).cloned() {
-                match slot.open(idx) {
+            } else if let Some(entry) = cameras.get(slot.selected).cloned() {
+                match slot.open(&entry) {
                     Ok((w, h)) => {
-                        *status = format!("[{}] {} ({}x{})", tag, name, w, h);
+                        *status = format!("[{}] {} ({}x{})", tag, entry.name, w, h);
                         *error = None;
                     }
                     Err(e) => *error = Some(e),
@@ -757,7 +1264,6 @@ fn render_slot(
             }
         }
 
-        // 参数
         ui.add_enabled_ui(is_open, |ui| {
             let resp = ui
                 .add(egui::Button::new("⚙").min_size(egui::vec2(28.0, 24.0)))
@@ -772,9 +1278,7 @@ fn render_slot(
         });
     });
 
-    // ---------- 第二行：拍照 / 录制 / FPS / 格式 / REC ----------
     ui.horizontal(|ui| {
-        // 拍照
         let photo_resp = ui.add_enabled(
             is_open,
             egui::Button::new("📷 拍照").min_size(egui::vec2(66.0, 24.0)),
@@ -789,7 +1293,6 @@ fn render_slot(
             }
         }
 
-        // 录制
         if is_recording {
             let resp = ui.add(
                 egui::Button::new("⏹ 停止")
@@ -826,28 +1329,35 @@ fn render_slot(
 
         ui.separator();
 
-        // FPS + 格式，紧凑显示
         ui.label(
             egui::RichText::new(format!("FPS {:.0}", slot.fps.value))
                 .color(egui::Color32::from_gray(180)),
         );
-        ui.label(
-            egui::RichText::new(slot.short_format_label())
-                .small()
-                .color(egui::Color32::from_gray(160)),
-        );
+        let fmt_label = slot.short_format_label();
+        let fmt_color = if is_switching {
+            egui::Color32::from_rgb(100, 180, 255)
+        } else {
+            egui::Color32::from_gray(160)
+        };
+        ui.label(egui::RichText::new(fmt_label).small().color(fmt_color));
 
-        // REC 状态右对齐
         ui.with_layout(
             egui::Layout::right_to_left(egui::Align::Center),
             |ui| {
                 if let Some(rec) = slot.recorder.as_ref() {
                     let d = rec.dropped.load(std::sync::atomic::Ordering::Relaxed);
                     let w = rec.written.load(std::sync::atomic::Ordering::Relaxed);
+                    let dur_str = slot
+                        .recording_elapsed()
+                        .map(fmt_duration)
+                        .unwrap_or_else(|| "00:00".to_string());
                     ui.label(
-                        egui::RichText::new(format!("● 写 {} / 丢 {}", w, d))
-                            .color(egui::Color32::from_rgb(230, 60, 60))
-                            .small(),
+                        egui::RichText::new(format!(
+                            "● REC {}  写 {} / 丢 {}",
+                            dur_str, w, d
+                        ))
+                        .color(egui::Color32::from_rgb(230, 60, 60))
+                        .small(),
                     );
                 }
             },
@@ -856,7 +1366,6 @@ fn render_slot(
 
     ui.separator();
 
-    // ---------- 预览区 ----------
     let avail = ui.available_size();
     if avail.y < 50.0 {
         ui.centered_and_justified(|ui| {
@@ -909,9 +1418,13 @@ fn paint_video(
     );
 }
 
-/// 在左上角画一条半透明底的提示文本。
-/// 双画面纯净和单画面纯净共用。
-fn paint_hint(ui: &egui::Ui, text: &str) {
+fn paint_hint(ui: &egui::Ui, text: &str, alpha: f32) {
+    if alpha <= 0.0 {
+        return;
+    }
+    let text_alpha = (255.0 * alpha).clamp(0.0, 255.0) as u8;
+    let bg_alpha = (120.0 * alpha).clamp(0.0, 255.0) as u8;
+
     let pos = ui.max_rect().left_top() + egui::vec2(12.0, 12.0);
     let galley = ui.painter().layout_no_wrap(
         text.to_string(),
@@ -920,8 +1433,12 @@ fn paint_hint(ui: &egui::Ui, text: &str) {
     );
     let bg = egui::Rect::from_min_size(pos, galley.size()).expand(6.0);
     ui.painter()
-        .rect_filled(bg, 4.0, egui::Color32::from_black_alpha(120));
-    ui.painter().galley(pos, galley, egui::Color32::WHITE);
+        .rect_filled(bg, 4.0, egui::Color32::from_black_alpha(bg_alpha));
+    ui.painter().galley(
+        pos,
+        galley,
+        egui::Color32::from_white_alpha(text_alpha),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -973,10 +1490,8 @@ fn render_pure_compare(ui: &mut egui::Ui, slots: &[CameraSlot; 2], layout: Compa
     ui.allocate_rect(rect, egui::Sense::hover());
 }
 
-/// 单画面纯净模式：全窗口只画一个 slot 的预览。
 fn render_pure_single(ui: &mut egui::Ui, slot: &CameraSlot, tag: &str) {
     let rect = ui.available_rect_before_wrap();
-    // paint_video 内部会先填黑，再按比例居中画纹理 / 显示“未打开”提示
     paint_video(ui, slot.texture.as_ref(), rect, tag, slot.is_open());
     ui.allocate_rect(rect, egui::Sense::hover());
 }
@@ -1011,15 +1526,12 @@ fn render_props_window(ctx: &egui::Context, slot: &mut CameraSlot, tag: &str) {
                 return;
             }
 
-            // ---------- 一键恢复默认 ----------
             ui.horizontal(|ui| {
                 if ui
                     .button("全部恢复默认")
                     .on_hover_text("把所有参数重置为驱动默认值")
                     .clicked()
                 {
-                    // 先改 UI 侧状态，再统一发送，避免边改边发时
-                    // 控制线程处理顺序和 UI 显示不一致。
                     for prop in slot.props.iter_mut() {
                         prop.current = prop.default;
                     }
@@ -1048,9 +1560,6 @@ fn render_props_window(ctx: &egui::Context, slot: &mut CameraSlot, tag: &str) {
             });
             ui.separator();
 
-            // ---------- 单个参数 ----------
-            // 改成 Vec：一帧内可能同时有多条命令要发
-            // （例如拖动滑块 + 勾选自动，或一键默认）。
             let mut pending: Vec<(PropertyKind, i32, i32, bool)> = Vec::new();
 
             egui::ScrollArea::vertical()
@@ -1122,6 +1631,83 @@ fn render_props_window(ctx: &egui::Context, slot: &mut CameraSlot, tag: &str) {
 
 impl eframe::App for CamCapApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 启动自动打开：第一帧启动后台线程，之后每帧 try_recv 收集结果。
+        // UI 在 ~250ms 出现，画面异步填充（~0.5–1s）。
+        if !self.pending_auto_open.is_empty() && !self.auto_open_in_progress {
+            self.auto_open_in_progress = true;
+            let pending = std::mem::take(&mut self.pending_auto_open);
+            let prefs: Vec<Option<(FormatSubtype, u32, u32, u32)>> = pending
+                .iter()
+                .map(|(si, _)| self.slots[*si].preferred_format)
+                .collect();
+            let tx = self.auto_open_tx.clone();
+            log::info!(
+                "启动自动打开：后台线程启动（{} 个设备）",
+                pending.len()
+            );
+            std::thread::spawn(move || {
+                for ((si, entry), preferred) in pending.into_iter().zip(prefs.into_iter()) {
+                    // CaptureHandle::start_with_format 返回 anyhow::Result，
+                    // AutoOpenResult.result 声明的是 Result<_, String>，转一下。
+                    let result = CaptureHandle::start_with_format(entry.index, preferred)
+                        .map_err(|e| e.to_string());
+                    if tx
+                        .send(Some(AutoOpenResult {
+                            slot_index: si,
+                            entry,
+                            result,
+                        }))
+                        .is_err()
+                    {
+                        // UI 线程已退出（窗口关闭），直接退出
+                        return;
+                    }
+                }
+                // sentinel：告知 UI 全部完成
+                let _ = tx.send(None);
+            });
+        }
+
+        // 收集后台自动打开结果。
+        // 保护：如果用户在打开完成前手动操作过该 slot（关闭 / 重新打开），
+        // 丢弃后台结果。CaptureHandle drop 会触发 stop 清理。
+        while let Ok(msg) = self.auto_open_rx.try_recv() {
+            match msg {
+                Some(msg) => {
+                    let tag = if msg.slot_index == 0 { "A" } else { "B" };
+                    let slot = &mut self.slots[msg.slot_index];
+                    let user_took_over = slot.user_closed || slot.capture.is_some();
+                    match msg.result {
+                        Ok(cap) => {
+                            if user_took_over {
+                                log::info!(
+                                    "启动自动打开 {}: 用户已手动操作，丢弃后台结果",
+                                    tag
+                                );
+                                // cap 被 drop，CaptureHandle::Drop 会 stop 线程
+                            } else {
+                                slot.install_capture(&msg.entry, cap);
+                                log::info!("启动自动打开 {}: {}", tag, msg.entry.name);
+                            }
+                        }
+                        Err(e) => {
+                            if !user_took_over {
+                                log::warn!("启动自动打开 {} 失败: {}", tag, e);
+                            }
+                        }
+                    }
+                }
+                None => {
+                    self.auto_open_in_progress = false;
+                    log::info!("启动自动打开：全部完成");
+                }
+            }
+        }
+
+        if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
+            self.current_window_size = Some([rect.width(), rect.height()]);
+        }
+
         let is_full_before = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
 
         let toggle_fullscreen = ctx.input(|i| {
@@ -1131,23 +1717,35 @@ impl eframe::App for CamCapApp {
             ctx.send_viewport_cmd(ViewportCommand::Fullscreen(!is_full_before));
         }
 
-        // P 键：切换纯净模式。
-        // 不再强制切到 Dual。当前是「仅 A」就进入单画面纯净 A，
-        // 当前是「双画面」就进入双画面纯净。
         if ctx.input(|i| i.key_pressed(Key::P)) {
-            self.pure_compare = !self.pure_compare;
+            self.toggle_pure_compare();
         }
 
-        // Tab：只在双画面纯净模式下切换左右/上下。
-        // 单画面纯净没有并排布局，Tab 不做任何事。
-        if self.pure_compare
-            && self.display_mode == DisplayMode::Dual
-            && ctx.input(|i| i.key_pressed(Key::Tab))
-        {
-            self.compare_layout = match self.compare_layout {
-                CompareLayout::Horizontal => CompareLayout::Vertical,
-                CompareLayout::Vertical => CompareLayout::Horizontal,
-            };
+        if self.pure_compare {
+            if self.display_mode == DisplayMode::Dual
+                && ctx.input(|i| i.key_pressed(Key::Tab))
+            {
+                self.compare_layout = match self.compare_layout {
+                    CompareLayout::Horizontal => CompareLayout::Vertical,
+                    CompareLayout::Vertical => CompareLayout::Horizontal,
+                };
+                self.config_dirty = true;
+            }
+
+            let mut new_mode: Option<DisplayMode> = None;
+            if ctx.input(|i| i.key_pressed(Key::Num1)) {
+                new_mode = Some(DisplayMode::Dual);
+            } else if ctx.input(|i| i.key_pressed(Key::Num2)) {
+                new_mode = Some(DisplayMode::SingleA);
+            } else if ctx.input(|i| i.key_pressed(Key::Num3)) {
+                new_mode = Some(DisplayMode::SingleB);
+            }
+            if let Some(m) = new_mode {
+                if m != self.display_mode {
+                    self.display_mode = m;
+                    self.config_dirty = true;
+                }
+            }
         }
 
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
@@ -1155,8 +1753,44 @@ impl eframe::App for CamCapApp {
                 ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
             } else if self.pure_compare {
                 self.pure_compare = false;
+                self.pure_hint_until = None;
             }
         }
+
+        if self.pure_compare {
+            let had_interaction = ctx.input(|i| {
+                let pointer_moved = i.pointer.delta() != egui::Vec2::ZERO;
+                let any_key_pressed = i.events.iter().any(|e| {
+                    matches!(e, egui::Event::Key { pressed: true, .. })
+                });
+                pointer_moved || any_key_pressed
+            });
+            if had_interaction {
+                self.pure_hint_until = Some(Instant::now() + PURE_HINT_DURATION);
+            }
+        }
+
+        let mut outcomes: Vec<(&'static str, SwitchOutcome)> = Vec::new();
+        if let Some(r) = self.slots[0].poll_switch() {
+            outcomes.push(("A", r));
+        }
+        if let Some(r) = self.slots[1].poll_switch() {
+            outcomes.push(("B", r));
+        }
+        for (tag, outcome) in outcomes {
+            match outcome {
+                SwitchOutcome::Success(f) => {
+                    self.status = format!("[{}] 格式已切换: {}", tag, f.label());
+                    self.error = None;
+                }
+                SwitchOutcome::Failed(e) => {
+                    log::warn!("[{}] 热切换失败: {}", tag, e);
+                    self.error = Some(format!("[{}] 切换失败: {}", tag, e));
+                }
+            }
+        }
+
+        self.poll_hotplug();
 
         match self.display_mode {
             DisplayMode::Dual => {
@@ -1170,6 +1804,7 @@ impl eframe::App for CamCapApp {
         let show_chrome = !is_full_before && !self.pure_compare;
 
         if show_chrome {
+            let any_recording = self.any_recording();
             egui::TopBottomPanel::top("toolbar")
                 .exact_height(72.0)
                 .show(ctx, |ui| {
@@ -1181,28 +1816,48 @@ impl eframe::App for CamCapApp {
                         if ui.button("关闭全部").clicked() {
                             self.close_both();
                         }
-                        if ui.button("刷新设备").clicked() {
+                        let refresh_resp = ui.add_enabled(
+                            !any_recording,
+                            egui::Button::new("刷新设备"),
+                        );
+                        if any_recording {
+                            refresh_resp.clone().on_hover_text(
+                                "录制中无法刷新设备，请先停止所有录制",
+                            );
+                        }
+                        if refresh_resp.clicked() {
                             self.refresh_cameras();
                         }
 
                         ui.separator();
 
                         ui.label("显示:");
-                        ui.selectable_value(
-                            &mut self.display_mode,
-                            DisplayMode::Dual,
-                            "双画面",
-                        );
-                        ui.selectable_value(
-                            &mut self.display_mode,
-                            DisplayMode::SingleA,
-                            "仅 A",
-                        );
-                        ui.selectable_value(
-                            &mut self.display_mode,
-                            DisplayMode::SingleB,
-                            "仅 B",
-                        );
+                        if ui
+                            .selectable_value(&mut self.display_mode, DisplayMode::Dual, "双画面")
+                            .changed()
+                        {
+                            self.config_dirty = true;
+                        }
+                        if ui
+                            .selectable_value(
+                                &mut self.display_mode,
+                                DisplayMode::SingleA,
+                                "仅 A",
+                            )
+                            .changed()
+                        {
+                            self.config_dirty = true;
+                        }
+                        if ui
+                            .selectable_value(
+                                &mut self.display_mode,
+                                DisplayMode::SingleB,
+                                "仅 B",
+                            )
+                            .changed()
+                        {
+                            self.config_dirty = true;
+                        }
 
                         ui.separator();
 
@@ -1214,8 +1869,7 @@ impl eframe::App for CamCapApp {
                         let pure_btn = egui::Button::new(pure_label)
                             .fill(egui::Color32::from_rgb(50, 90, 160));
                         if ui.add(pure_btn).clicked() {
-                            // 同样不再强制切到 Dual
-                            self.pure_compare = !self.pure_compare;
+                            self.toggle_pure_compare();
                         }
 
                         if ui.button("全屏 (F11)").clicked() {
@@ -1243,13 +1897,35 @@ impl eframe::App for CamCapApp {
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(&self.status);
-                        if let Some(err) = &self.error {
+
+                        let disconnected: Vec<&str> = [
+                            ("A", self.slots[0].has_error()),
+                            ("B", self.slots[1].has_error()),
+                        ]
+                        .iter()
+                        .filter(|(_, e)| *e)
+                        .map(|(t, _)| *t)
+                        .collect();
+
+                        if !disconnected.is_empty() {
+                            ui.separator();
+                            let msg = if disconnected.len() == 2 {
+                                "画面 A / B 设备已断开".to_string()
+                            } else {
+                                format!("画面 {} 设备已断开", disconnected[0])
+                            };
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 80, 80),
+                                msg,
+                            );
+                        } else if let Some(err) = &self.error {
                             ui.separator();
                             ui.colored_label(
                                 egui::Color32::from_rgb(220, 80, 80),
                                 err,
                             );
                         }
+
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
@@ -1270,6 +1946,7 @@ impl eframe::App for CamCapApp {
         let pure = self.pure_compare;
         let mode = self.display_mode;
         let layout = self.compare_layout;
+        let hint_alpha = self.pure_hint_alpha();
 
         let mut panel = egui::CentralPanel::default();
         if pure {
@@ -1278,27 +1955,40 @@ impl eframe::App for CamCapApp {
 
         panel.show(ctx, |ui| {
             if pure {
-                // 纯净模式：按当前 display_mode 分三种
                 match mode {
                     DisplayMode::Dual => {
                         render_pure_compare(ui, &self.slots, layout);
-                        let layout_name = match layout {
-                            CompareLayout::Horizontal => "左右",
-                            CompareLayout::Vertical => "上下",
-                        };
-                        let hint = format!(
-                            "纯净对比 [{}]   Tab 切换左右/上下   P / Esc 退出",
-                            layout_name
-                        );
-                        paint_hint(ui, &hint);
+                        if hint_alpha > 0.0 {
+                            let layout_name = match layout {
+                                CompareLayout::Horizontal => "左右",
+                                CompareLayout::Vertical => "上下",
+                            };
+                            let hint = format!(
+                                "纯净对比 [{}]   Tab 切换左右/上下   1/2/3 切换画面   P / Esc 退出",
+                                layout_name
+                            );
+                            paint_hint(ui, &hint, hint_alpha);
+                        }
                     }
                     DisplayMode::SingleA => {
                         render_pure_single(ui, &self.slots[0], "A");
-                        paint_hint(ui, "纯净模式 [画面 A]   P / Esc 退出");
+                        if hint_alpha > 0.0 {
+                            paint_hint(
+                                ui,
+                                "纯净模式 [画面 A]   1/2/3 切换画面   P / Esc 退出",
+                                hint_alpha,
+                            );
+                        }
                     }
                     DisplayMode::SingleB => {
                         render_pure_single(ui, &self.slots[1], "B");
-                        paint_hint(ui, "纯净模式 [画面 B]   P / Esc 退出");
+                        if hint_alpha > 0.0 {
+                            paint_hint(
+                                ui,
+                                "纯净模式 [画面 B]   1/2/3 切换画面   P / Esc 退出",
+                                hint_alpha,
+                            );
+                        }
                     }
                 }
             } else {
@@ -1367,8 +2057,28 @@ impl eframe::App for CamCapApp {
             }
         }
 
-        if self.slots[0].is_open() || self.slots[1].is_open() {
-            ctx.request_repaint_after(Duration::from_millis(16));
+        self.save_if_dirty();
+
+        if self.pure_compare && hint_alpha > 0.0 {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        } else {
+            let any_recording =
+                self.slots[0].is_recording() || self.slots[1].is_recording();
+            if self.slots[0].is_open() || self.slots[1].is_open() {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            } else if any_recording {
+                ctx.request_repaint_after(Duration::from_millis(200));
+            } else if self.auto_open_in_progress {
+                // 自动打开进行中，50ms 刷一次，尽快发现结果
+                ctx.request_repaint_after(Duration::from_millis(50));
+            } else if self.config_dirty
+                || self.slots[0].config_dirty
+                || self.slots[1].config_dirty
+            {
+                ctx.request_repaint_after(Duration::from_millis(200));
+            } else {
+                ctx.request_repaint_after(HOTPLUG_POLL_INTERVAL);
+            }
         }
     }
 }
