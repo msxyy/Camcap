@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="64 56 384 384" width="384" height="384"
+     shape-rendering="crispEdges">
+
+  <!-- ===== 画布背景（与镜头外圈同色） ===== -->
+  <rect x="64" y="56" width="384" height="384" fill="#0A0A0A"/>
+
+  <!-- ===== 机身深色外轮廓 ===== -->
+  <rect x="64" y="112" width="384" height="272" fill="#3A3A3A"/>
+
+  <!-- ===== 机身内部（白色） ===== -->
+  <rect x="80" y="128" width="352" height="240" fill="#FFFFFF"/>
+
+  <!-- ===== 内部极淡 bevel ===== -->
+  <rect x="80"  y="128" width="352" height="16" fill="#DEDEDE"/>
+  <rect x="80"  y="352" width="352" height="16" fill="#B0B0B0"/>
+  <rect x="80"  y="144" width="16"  height="208" fill="#DEDEDE"/>
+  <rect x="416" y="144" width="16"  height="208" fill="#B0B0B0"/>
+
+  <!-- ===== 镜头外圈（黑） ===== -->
+  <g fill="#0A0A0A">
+    <rect x="256" y="144" width="16"  height="16"/>
+    <rect x="208" y="160" width="112" height="16"/>
+    <rect x="192" y="176" width="144" height="16"/>
+    <rect x="176" y="192" width="176" height="16"/>
+    <rect x="176" y="208" width="176" height="16"/>
+    <rect x="176" y="224" width="176" height="16"/>
+    <rect x="160" y="240" width="208" height="16"/>
+    <rect x="176" y="256" width="176" height="16"/>
+    <rect x="176" y="272" width="176" height="16"/>
+    <rect x="176" y="288" width="176" height="16"/>
+    <rect x="192" y="304" width="144" height="16"/>
+    <rect x="208" y="320" width="112" height="16"/>
+    <rect x="256" y="336" width="16"  height="16"/>
+  </g>
+
+  <!-- ===== 镜头金属环 ===== -->
+  <g fill="#6B6B6B">
+    <rect x="256" y="160" width="16"  height="16"/>
+    <rect x="208" y="176" width="112" height="16"/>
+    <rect x="192" y="192" width="144" height="16"/>
+    <rect x="192" y="208" width="144" height="16"/>
+    <rect x="192" y="224" width="144" height="16"/>
+    <rect x="176" y="240" width="176" height="16"/>
+    <rect x="192" y="256" width="144" height="16"/>
+    <rect x="192" y="272" width="144" height="16"/>
+    <rect x="192" y="288" width="144" height="16"/>
+    <rect x="208" y="304" width="112" height="16"/>
+    <rect x="256" y="320" width="16"  height="16"/>
+  </g>
+
+  <!-- ===== 镜头内圈 ===== -->
+  <g fill="#161616">
+    <rect x="256" y="176" width="16"  height="16"/>
+    <rect x="224" y="192" width="80"  height="16"/>
+    <rect x="208" y="208" width="112" height="16"/>
+    <rect x="208" y="224" width="112" height="16"/>
+    <rect x="192" y="240" width="144" height="16"/>
+    <rect x="208" y="256" width="112" height="16"/>
+    <rect x="208" y="272" width="112" height="16"/>
+    <rect x="224" y="288" width="80"  height="16"/>
+    <rect x="256" y="304" width="16"  height="16"/>
+  </g>
+
+  <!-- ===== 玻璃 ===== -->
+  <g fill="#0C1822">
+    <rect x="256" y="192" width="16"  height="16"/>
+    <rect x="224" y="208" width="80"  height="16"/>
+    <rect x="224" y="224" width="80"  height="16"/>
+    <rect x="208" y="240" width="112" height="16"/>
+    <rect x="224" y="256" width="80"  height="16"/>
+    <rect x="224" y="272" width="80"  height="16"/>
+    <rect x="256" y="288" width="16"  height="16"/>
+  </g>
+
+  <!-- ===== 玻璃中心 ===== -->
+  <rect x="240" y="224" width="48" height="48" fill="#04080C"/>
+
+  <!-- ===== 硬边高光 ===== -->
+  <rect x="224" y="208" width="16" height="16" fill="#FFFFFF" opacity="0.65"/>
+  <rect x="272" y="256" width="16" height="16" fill="#FFFFFF" opacity="0.25"/>
+
+  <!-- ===== 红色录制点 ===== -->
+  <rect x="368" y="144" width="48" height="48" fill="#A03020"/>
+  <rect x="368" y="144" width="16" height="16" fill="#C04838"/>
+
+  <!-- ===== 绿色工作灯 ===== -->
+  <rect x="96" y="304" width="32" height="32" fill="#2A6B30"/>
+  <rect x="96" y="304" width="16" height="16" fill="#3D8A42"/>
+
+  <!-- ===== 左右散热槽 ===== -->
+  <rect x="96"  y="208" width="32" height="80" fill="#1A1A1A"/>
+  <rect x="384" y="208" width="32" height="80" fill="#1A1A1A"/>
+</svg>

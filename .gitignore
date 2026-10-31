@@ -27,3 +27,6 @@ desktop.ini
 *.tmp
 *.bak
 *~
+
+/assets/camcap-256.png
+/assets/camcap.ico

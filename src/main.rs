@@ -60,10 +60,14 @@ fn main() -> Result<()> {
     let cfg = config::load();
     let inner_size = cfg.window_size.unwrap_or([1280.0, 720.0]);
 
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/camcap-256.png"))
+        .map_err(|e| anyhow::anyhow!("加载窗口图标失败: {}", e))?;
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(inner_size)
-            .with_title("CamCap"),
+            .with_title("CamCap")
+            .with_icon(icon),
         ..Default::default()
     };
 
